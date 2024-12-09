@@ -13,7 +13,15 @@ use crate::query_result::Value::{CollectionValue, RegularValue};
 use crate::types::*;
 use crate::uuid::CassUuid;
 use scylla::deserialize::result::TypedRowIterator;
-use scylla::frame::response::result::{ColumnSpec, CqlValue, DeserializedMetadataAndRawRows, Row};
+use scylla::deserialize::row::{
+    BuiltinDeserializationError, BuiltinDeserializationErrorKind, ColumnIterator,
+};
+use scylla::deserialize::{
+    DeserializationError, DeserializeRow, DeserializeValue, FrameSlice, TypeCheckError,
+};
+use scylla::frame::response::result::{
+    ColumnSpec, ColumnType, CqlValue, DeserializedMetadataAndRawRows, Row,
+};
 use scylla::transport::query_result::{ColumnSpecs, IntoRowsResultError};
 use scylla::transport::PagingStateResponse;
 use scylla::QueryResult;
@@ -156,6 +164,41 @@ impl CassResultMetadata {
     }
 }
 
+pub struct CassRawRow<'result> {
+    columns: Vec<CassRawValue<'result>>,
+}
+
+impl<'frame, 'metadata, 'result> DeserializeRow<'frame, 'metadata> for CassRawRow<'result>
+where
+    'frame: 'result,
+    'metadata: 'result,
+{
+    fn type_check(_specs: &[ColumnSpec]) -> Result<(), TypeCheckError> {
+        Ok(())
+    }
+
+    fn deserialize(
+        mut row: ColumnIterator<'frame, 'metadata>,
+    ) -> Result<Self, DeserializationError> {
+        let mut columns = Vec::with_capacity(row.size_hint().0);
+        while let Some(column) = row.next().transpose()? {
+            columns.push(
+                <CassRawValue>::deserialize(column.spec.typ(), column.slice).map_err(|err| {
+                    DeserializationError::new(BuiltinDeserializationError {
+                        rust_name: std::any::type_name::<CassRawValue>(),
+                        kind: BuiltinDeserializationErrorKind::ColumnDeserializationFailed {
+                            column_index: column.index,
+                            column_name: column.spec.name().to_owned(),
+                            err,
+                        },
+                    })
+                })?,
+            );
+        }
+        Ok(Self { columns })
+    }
+}
+
 /// The lifetime of CassRow is bound to CassResult.
 /// It will be freed, when CassResult is freed.(see #[cass_result_free])
 pub struct CassRow<'result> {
@@ -173,6 +216,28 @@ impl<'result> CassRow<'result> {
             columns: create_cass_row_columns(row, metadata),
             result_metadata: metadata,
         }
+    }
+}
+
+pub struct CassRawValue<'result> {
+    pub typ: &'result ColumnType<'result>,
+    pub slice: Option<FrameSlice<'result>>,
+}
+
+impl<'frame, 'metadata, 'result> DeserializeValue<'frame, 'metadata> for CassRawValue<'result>
+where
+    'metadata: 'result,
+    'frame: 'result,
+{
+    fn type_check(_typ: &ColumnType) -> Result<(), TypeCheckError> {
+        Ok(())
+    }
+
+    fn deserialize(
+        typ: &'metadata ColumnType<'metadata>,
+        v: Option<FrameSlice<'frame>>,
+    ) -> Result<Self, DeserializationError> {
+        Ok(Self { typ, slice: v })
     }
 }
 
