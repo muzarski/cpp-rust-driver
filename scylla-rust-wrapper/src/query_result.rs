@@ -26,8 +26,28 @@ pub enum CassResultKind {
 
 pub struct CassRowsResult {
     pub raw_rows: DeserializedMetadataAndRawRows,
-    pub first_row: Option<CassRow>,
+    // 'static, because of self-borrowing.
+    // CassRow borrows `metadata` field.
+    pub first_row: Option<CassRow<'static>>,
     pub metadata: Arc<CassResultMetadata>,
+}
+
+impl CassRowsResult {
+    // SAFETY: Caller needs to ensure that this row will live no longer than `CassRowsResult` that it borrows from.
+    unsafe fn create_first_row(
+        raw_rows: &DeserializedMetadataAndRawRows,
+        metadata: &CassResultMetadata,
+    ) -> Result<Option<CassRow<'static>>, CassErrorResult> {
+        let first_row = raw_rows
+            .rows_iter::<Row>()
+            // unwrap: Row always passes the typecheck.
+            .unwrap()
+            .next()
+            .transpose()?
+            .map(|row| std::mem::transmute(CassRow::from_row_and_metadata(row, metadata)));
+
+        Ok(first_row)
+    }
 }
 
 pub struct CassResult {
@@ -58,13 +78,9 @@ impl CassResult {
                 });
 
                 let (raw_rows, tracing_id, _) = rows_result.into_inner();
-                let first_row = raw_rows
-                    .rows_iter::<Row>()
-                    // unwrap: Row always passes the typecheck.
-                    .unwrap()
-                    .next()
-                    .transpose()?
-                    .map(|row| CassRow::from_row_and_metadata(row, &metadata));
+                // SAFETY: We make sure that `CassRow` will live no longer than `CassRowsResult` that it borrows from.
+                // This is becase, first_row is a part of constructed CassRowsResult.
+                let first_row = unsafe { CassRowsResult::create_first_row(&raw_rows, &metadata)? };
 
                 let cass_result = CassResult {
                     tracing_id,
@@ -121,20 +137,20 @@ impl CassResultMetadata {
 
 /// The lifetime of CassRow is bound to CassResult.
 /// It will be freed, when CassResult is freed.(see #[cass_result_free])
-pub struct CassRow {
+pub struct CassRow<'result> {
     pub columns: Vec<CassValue>,
-    pub result_metadata: Arc<CassResultMetadata>,
+    pub result_metadata: &'result CassResultMetadata,
 }
 
-impl FFI for CassRow {
+impl FFI for CassRow<'_> {
     type Origin = FromRef;
 }
 
-impl CassRow {
-    pub fn from_row_and_metadata(row: Row, metadata: &Arc<CassResultMetadata>) -> Self {
+impl<'result> CassRow<'result> {
+    pub fn from_row_and_metadata(row: Row, result_metadata: &'result CassResultMetadata) -> Self {
         Self {
-            columns: create_cass_row_columns(row, metadata),
-            result_metadata: Arc::clone(metadata),
+            columns: create_cass_row_columns(row, result_metadata),
+            result_metadata,
         }
     }
 }
@@ -165,7 +181,7 @@ impl FFI for CassValue {
     type Origin = FromRef;
 }
 
-fn create_cass_row_columns(row: Row, metadata: &Arc<CassResultMetadata>) -> Vec<CassValue> {
+fn create_cass_row_columns(row: Row, metadata: &CassResultMetadata) -> Vec<CassValue> {
     row.columns
         .into_iter()
         .zip(metadata.col_specs.iter())
@@ -297,10 +313,10 @@ unsafe fn result_has_more_pages(result: &CassBorrowedPtr<CassResult, CConst>) ->
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn cass_row_get_column(
-    row_raw: CassBorrowedPtr<CassRow, CConst>,
+pub unsafe extern "C" fn cass_row_get_column<'result>(
+    row_raw: CassBorrowedPtr<'result, CassRow<'result>, CConst>,
     index: size_t,
-) -> CassBorrowedPtr<CassValue, CConst> {
+) -> CassBorrowedPtr<'result, CassValue, CConst> {
     let row: &CassRow = RefFFI::as_ref(row_raw).unwrap();
 
     let index_usize: usize = index.try_into().unwrap();
@@ -313,10 +329,10 @@ pub unsafe extern "C" fn cass_row_get_column(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn cass_row_get_column_by_name(
-    row: CassBorrowedPtr<CassRow, CConst>,
+pub unsafe extern "C" fn cass_row_get_column_by_name<'result>(
+    row: CassBorrowedPtr<'result, CassRow<'result>, CConst>,
     name: *const c_char,
-) -> CassBorrowedPtr<CassValue, CConst> {
+) -> CassBorrowedPtr<'result, CassValue, CConst> {
     let name_str = ptr_to_cstr(name).unwrap();
     let name_length = name_str.len();
 
@@ -324,11 +340,11 @@ pub unsafe extern "C" fn cass_row_get_column_by_name(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn cass_row_get_column_by_name_n(
-    row: CassBorrowedPtr<CassRow, CConst>,
+pub unsafe extern "C" fn cass_row_get_column_by_name_n<'result>(
+    row: CassBorrowedPtr<'result, CassRow<'result>, CConst>,
     name: *const c_char,
     name_length: size_t,
-) -> CassBorrowedPtr<CassValue, CConst> {
+) -> CassBorrowedPtr<'result, CassValue, CConst> {
     let row_from_raw = RefFFI::as_ref(row).unwrap();
     let mut name_str = ptr_to_cstr_n(name, name_length).unwrap();
     let mut is_case_sensitive = false;
@@ -901,20 +917,26 @@ mod tests {
             ),
         ])));
 
-        let first_row = Some(CassRow::from_row_and_metadata(
-            Row {
-                columns: vec![
-                    Some(CqlValue::BigInt(42)),
-                    None,
-                    Some(CqlValue::List(vec![
-                        CqlValue::Float(0.5),
-                        CqlValue::Float(42.42),
-                        CqlValue::Float(9999.9999),
-                    ])),
-                ],
-            },
-            &metadata,
-        ));
+        // SAFETY: We make sure that first_row lives no longer than CassResult that
+        // it borrows metadata from.
+        let first_row = unsafe {
+            Some(std::mem::transmute::<CassRow<'_>, CassRow<'static>>(
+                CassRow::from_row_and_metadata(
+                    Row {
+                        columns: vec![
+                            Some(CqlValue::BigInt(42)),
+                            None,
+                            Some(CqlValue::List(vec![
+                                CqlValue::Float(0.5),
+                                CqlValue::Float(42.42),
+                                CqlValue::Float(9999.9999),
+                            ])),
+                        ],
+                    },
+                    &metadata,
+                ),
+            ))
+        };
 
         CassResult {
             tracing_id: None,
