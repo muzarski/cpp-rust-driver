@@ -654,6 +654,9 @@ unsigned int CCM::Bridge::add_node(const std::string& data_center /*= ""*/) {
   if (is_dse()) {
     add_node_command.push_back("--dse");
   }
+  else if (is_scylla_) {
+    add_node_command.push_back("--scylla");
+  }
   add_node_command.push_back(generate_node_name(node));
   execute_ccm_command(add_node_command);
 
@@ -661,7 +664,7 @@ unsigned int CCM::Bridge::add_node(const std::string& data_center /*= ""*/) {
   return node;
 }
 
-unsigned int CCM::Bridge::bootstrap_node(const std::vector<std::string>& jvm_arguments,
+unsigned int CCM::Bridge::bootstrap_node(std::vector<std::string> jvm_arguments,
                                          const std::string& data_center /*= ""*/) {
   unsigned int node = add_node(data_center);
   start_node(node, jvm_arguments);
@@ -795,7 +798,7 @@ void CCM::Bridge::resume_node(unsigned int node) {
 }
 
 bool CCM::Bridge::start_node(
-    unsigned int node, const std::vector<std::string>& jvm_arguments /*= DEFAULT_JVM_ARGUMENTS*/) {
+    unsigned int node, std::vector<std::string> jvm_arguments /*= DEFAULT_JVM_ARGUMENTS*/) {
   // Create the node start command and execute
   std::vector<std::string> start_node_command;
   start_node_command.push_back(generate_node_name(node));
@@ -809,6 +812,15 @@ bool CCM::Bridge::start_node(
     }
   }
 #endif
+  if (is_scylla_ && smp_ != DEFAULT_SMP) {
+    jvm_arguments.push_back("--smp");
+    std::ostringstream oss;
+    oss << smp_;
+    jvm_arguments.push_back(oss.str());
+  }
+  if (is_scylla_) {
+    jvm_arguments.push_back("--skip-wait-for-gossip-to-settle=0");
+  }
   for (std::vector<std::string>::const_iterator iterator = jvm_arguments.begin();
        iterator != jvm_arguments.end(); ++iterator) {
     std::string jvm_argument = trim(*iterator);

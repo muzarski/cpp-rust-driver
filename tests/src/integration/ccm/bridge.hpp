@@ -426,7 +426,7 @@ public:
    * @return Node added to cluster
    * @throws BridgeException
    */
-  unsigned int bootstrap_node(const std::vector<std::string>& jvm_arguments,
+  unsigned int bootstrap_node(std::vector<std::string> jvm_arguments,
                               const std::string& data_center = "");
 
   /**
@@ -572,7 +572,7 @@ public:
    * @return True if node is up; false otherwise
    */
   bool start_node(unsigned int node,
-                  const std::vector<std::string>& jvm_arguments = DEFAULT_JVM_ARGUMENTS);
+                  std::vector<std::string> jvm_arguments = DEFAULT_JVM_ARGUMENTS);
 
   /**
    * Start a node on the active Cassandra cluster with an additional JVM
